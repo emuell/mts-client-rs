@@ -11,11 +11,11 @@
 //! # Real-time safety
 //!
 //! [`Client::new`] allocates and `dlopen`s. Call it once, but never from a real-time thread.
-//! 
+//!
 //! [`Client::should_filter_note`], [`Client::retuning_in_semitones`], [`Client::retuning_as_ratio`]
 //! and [`Client::note_to_frequency`] are lock-free reads of the master's shared tuning table, and
-//! are safe to call in real-time threads. 
-//! 
+//! are safe to call in real-time threads.
+//!
 //! Everything else is for the UI or other non real-time threads.
 //!
 //! # Example
