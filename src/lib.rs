@@ -1,12 +1,16 @@
 //! Safe Rust bindings for [MTS-ESP](https://github.com/ODDSound/MTS-ESP), ODDSound's microtuning
 //! protocol for audio plugins.
 //!
-//! This crate only wraps the vendored ODDSound **client** library (`libMTSClient`, 0BSD) as
-//! [`Client`], avoiding unsafe code in user-facing APIs. The raw C API is available under [`sys`].
+//! This crate only wraps the vendored ODDSound `libMTSClient` library as [`Client`], avoiding
+//! unsafe code in user-facing APIs. The raw C API is available under [`sys`].
 //!
-//! `libMTS`, the library that actually handles the tuning, is loaded dynamically, and thus is
+//! `libMTS`, the library that actually handles the tuning is loaded dynamically, and thus is
 //! not linked in, so there is nothing to ship with your plugin or app. When it is not installed,
-//! or no master is connected, all client functions respond as if a plain 12-TET is loaded.
+//! or no master is connected, all client functions respond as if a plain 12-TET is loaded, so
+//! there is no need to check for a master before querying.
+//!
+//! `libMTS` itself usually is installed by the user alongside whichever MTS-ESP master they use.
+//! Installers are at [ODDSound/MTS-ESP/libMTS](https://github.com/ODDSound/MTS-ESP/tree/main/libMTS).
 //!
 //! # Real-time safety
 //!
@@ -16,20 +20,28 @@
 //! and [`Client::note_to_frequency`] are lock-free reads of the master's shared tuning table, and
 //! are safe to call in real-time threads.
 //!
-//! Everything else is for the UI or other non real-time threads.
+//! Everything else is for the UI or other non real-time threads. That includes dropping the
+//! client: deregistering calls into `libMTS` and frees its tuning tables. Keep an `Arc<Client>`
+//! alive on a non real-time thread for the plugin's lifetime, so a real-time thread never holds
+//! the last reference and runs the drop itself.
 //!
-//! # Example
+//! # Usage
 //!
-//! ## Main Thread (initialize)
+//! ## Main thread (initialize)
+//!
+//! Create one [`Client`] per plugin instance, on the main or some other non audio thread. It is
+//! [`Send`] and [`Sync`], so wrap it in an `Arc` to share it with the audio, worker or UI threads:
 //!
 //! ```no_run
 //! use std::sync::Arc;
 //! use mts_client_rs::Client;
 //!
-//! let mts_client = Client::new().map(Arc::new).expect("Failed to register the MTS-ESP client");
+//! let mts_client = Client::new().map(Arc::new).expect("Failed to create MTS-ESP client");
 //! ```
 //!
-//! ## Audio Thread (processing)
+//! ## Audio thread (processing)
+//!
+//! On note-on, skip keys that the master leaves unmapped, then apply the tuning:
 //!
 //! ```no_run
 //! use std::sync::Arc;
@@ -39,13 +51,52 @@
 //! fn play_note(mts_client: &Arc<Client>, note: u8) {
 //!     // An unmapped key should not start a voice.
 //!     if !mts_client.should_filter_note(note, None) {
-//!         // The semitone offset composes well with other pitch modulation values,
-//!         // where an absolute frequency would override them.
 //!         let semitones = mts_client.retuning_in_semitones(note, None);
 //!         // add `semitones` to your voice's pitch
 //!     }
 //! }
 //! ```
+//!
+//! Prefer the semitone offset over [`Client::note_to_frequency`]: it composes with pitch bend, note
+//! expressions and glide, whereas an absolute frequency overrides them. Masters can automate their
+//! tuning, so re-query held notes periodically if you want them to follow changes.
+//!
+//! Pass `Some(channel)` instead of `None` when the note's MIDI channel is known, so masters using
+//! multi-channel tuning tables can answer precisely.
+//!
+//! ## Reporting tuning to the user
+//!
+//! ```no_run
+//! # use mts_client_rs::Client;
+//! # let mts_client = Client::new().unwrap();
+//! if mts_client.has_master() {
+//!     println!("MTS-ESP: {}", mts_client.scale_name());
+//! }
+//! ```
+//!
+//! There is also [`Client::period_ratio`] / [`Client::period_semitones`] for the scale's period,
+//! and [`Client::map_size`] / [`Client::map_start_key`] / [`Client::reference_key`] for the
+//! keyboard map.
+//!
+//! ## MTS SysEx fallback
+//!
+//! To honour MTS SysEx tuning messages when no MTS-ESP master is present, feed incoming MIDI to
+//! the client. A connected master always takes precedence and non-MTS bytes are silently ignored:
+//!
+//! ```no_run
+//! # use mts_client_rs::Client;
+//! # let mut mts_client = Client::new().unwrap();
+//! # let midi_bytes: &[u8] = &[];
+//! mts_client.parse_midi_data(midi_bytes);
+//! ```
+//!
+//! # Platform notes
+//!
+//! On Windows, a standalone binary may not find `libMTS`. The client locates `LIBMTS.dll`
+//! through `SHGetKnownFolderPath`, which it only resolves when `Shell32.dll` and `Ole32.dll` are
+//! already loaded. Plugin hosts usually will have both loaded, a plain console binary not, and
+//! then every query silently answers as plain 12-TET. Preload the two DLLs from an early CRT
+//! initializer if you need a standalone app to see a master.
 
 use std::{ffi::CStr, os::raw::c_char, ptr::NonNull};
 
