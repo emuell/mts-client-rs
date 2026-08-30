@@ -105,7 +105,7 @@ impl Client {
     /// True when the installed `libMTS` is older than the API this client was built against, and
     /// so cannot serve all of it. You may want to hint this in your UI.
     pub fn should_update_library(&self) -> bool {
-        unsafe { sys::MTS_Client_ShouldUpdateLibrary(self.as_ptr()) }
+        unsafe { sys::MTS_ShouldUpdateLibrary(self.as_ptr()) }
     }
 
     /// True when the master's keyboard map leaves `note` unmapped, in which case the note should

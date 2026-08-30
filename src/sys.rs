@@ -19,7 +19,7 @@ unsafe extern "C" {
     pub fn MTS_DeregisterClient(client: *mut MTSClient);
 
     pub fn MTS_HasMaster(client: *mut MTSClient) -> bool;
-    pub fn MTS_Client_ShouldUpdateLibrary(client: *mut MTSClient) -> bool;
+    pub fn MTS_ShouldUpdateLibrary(client: *mut MTSClient) -> bool;
 
     pub fn MTS_ShouldFilterNote(client: *mut MTSClient, note: c_char, channel: i8) -> bool;
 
