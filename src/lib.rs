@@ -2,12 +2,12 @@
 //! protocol for audio plugins.
 //!
 //! This crate only wraps the vendored ODDSound `libMTSClient` library as [`Client`], avoiding
-//! unsafe code in user-facing APIs. The raw C API is available under [`sys`].
+//! unsafe code in user-facing APIs. The raw C API is available at [`sys`].
 //!
-//! `libMTS`, the library that actually handles the tuning is loaded dynamically, and thus is
-//! not linked in, so there is nothing to ship with your plugin or app. When it is not installed,
+//! `libMTS`, the library that actually handles the tuning, is loaded dynamically, and thus is
+//! not linked in. So there is nothing to ship with your plugin or app. When it is not installed,
 //! or no master is connected, all client functions respond as if a plain 12-TET is loaded, so
-//! there is no need to check for a master before querying.
+//! there is no need to check for a master before querying/applying tunings.
 //!
 //! `libMTS` itself usually is installed by the user alongside whichever MTS-ESP master they use.
 //! Installers are at [ODDSound/MTS-ESP/libMTS](https://github.com/ODDSound/MTS-ESP/tree/main/libMTS).
@@ -20,6 +20,9 @@
 //! and [`Client::note_to_frequency`] are lock-free reads of the master's shared tuning table, and
 //! are safe to call in real-time threads.
 //!
+//! [`TuningMap`] is real-time safe throughout, including map updates: it is built from those reads
+//! only.
+//!
 //! Everything else is for the UI or other non real-time threads. That includes dropping the
 //! client: deregistering calls into `libMTS` and frees its tuning tables. Keep an `Arc<Client>`
 //! alive on a non real-time thread for the plugin's lifetime, so a real-time thread never holds
@@ -30,7 +33,8 @@
 //! ## Main thread (initialize)
 //!
 //! Create one [`Client`] per plugin instance, on the main or some other non audio thread. It is
-//! [`Send`] and [`Sync`], so wrap it in an `Arc` to share it with the audio, worker or UI threads:
+//! [`Send`] and [`Sync`], so you can wrap it in `Arc` to share it with the audio, worker or UI
+//! threads:
 //!
 //! ```no_run
 //! use std::sync::Arc;
@@ -41,7 +45,7 @@
 //!
 //! ## Audio thread (processing)
 //!
-//! On note-on, skip keys that the master leaves unmapped, then apply the tuning:
+//! Apply tuning on note-on, skipping keys that the master leaves unmapped:
 //!
 //! ```no_run
 //! use std::sync::Arc;
@@ -57,12 +61,41 @@
 //! }
 //! ```
 //!
-//! Prefer the semitone offset over [`Client::note_to_frequency`]: it composes with pitch bend, note
-//! expressions and glide, whereas an absolute frequency overrides them. Masters can automate their
-//! tuning, so re-query held notes periodically if you want them to follow changes.
+//! Prefer the semitone offset over [`Client::note_to_frequency`]: it composes with pitch modulation,
+//! whereas an absolute frequency overrides them. To have that modulation follow the scale rather
+//! than 12-TET, use [`TuningMap`] instead, as shown below.
+//!
+//! Masters can automate their tuning, so re-query held notes periodically if you want them to follow
+//! changes.
 //!
 //! Pass `Some(channel)` instead of `None` when the note's MIDI channel is known, so masters using
 //! multi-channel tuning tables can answer precisely.
+//!
+//! ## Modulating pitch within the scale
+//!
+//! A synth voice usually also has pitch modulation. When adding modulation as plain semitones,
+//! such modulation would move in 12-TET, while the note it starts from sits in the master's scale.
+//! Especially with MPE that is fatal: pitch bend is used here to move to another note, so a bend
+//! that ignores the scale, never reaches the target note's pitch in the scale.
+//!
+//! [`TuningMap`] indexes the tuning by scale steps rather than by MIDI key, so one unit of
+//! modulation is one note of the scale and fractions to interpolate between neighbours:
+//!
+//! ```no_run
+//! use mts_client_rs::{Client, TuningMap};
+//!
+//! # let mts_client = Client::new().unwrap();
+//! let mut tuning = TuningMap::new();
+//!
+//! // Update periodically, e.g. once per audio block, so active voices follow automated tunings.
+//! tuning.update(&mts_client, None);
+//!
+//! // Per voice, where `modulation` is the total pitch offset in semitones from the key.
+//! # let (note, modulation) = (60, 2.0);
+//! if !tuning.should_filter_note(note) {
+//!     let frequency = tuning.frequency(note, modulation);
+//! }
+//! ```
 //!
 //! ## Reporting tuning to the user
 //!
@@ -74,7 +107,7 @@
 //! }
 //! ```
 //!
-//! There is also [`Client::period_ratio`] / [`Client::period_semitones`] for the scale's period,
+//! There also is [`Client::period_ratio`] / [`Client::period_semitones`] for the scale's period,
 //! and [`Client::map_size`] / [`Client::map_start_key`] / [`Client::reference_key`] for the
 //! keyboard map.
 //!
@@ -94,13 +127,16 @@
 //!
 //! On Windows, a standalone binary may not find `libMTS`. The client locates `LIBMTS.dll`
 //! through `SHGetKnownFolderPath`, which it only resolves when `Shell32.dll` and `Ole32.dll` are
-//! already loaded. Plugin hosts usually will have both loaded, a plain console binary not, and
-//! then every query silently answers as plain 12-TET. Preload the two DLLs from an early CRT
-//! initializer if you need a standalone app to see a master.
+//! already loaded. Plugin hosts usually will have both libraries loaded, a plain console binary
+//! not, so every query silently answers as plain 12-TET. To fix this, preload the two DLLs from
+//! an early CRT initializer in your standalone app.
 
 use std::{ffi::CStr, os::raw::c_char, ptr::NonNull};
 
 pub mod sys;
+
+mod tuning;
+pub use tuning::TuningMap;
 
 // -------------------------------------------------------------------------------------------------
 
@@ -168,14 +204,17 @@ impl Client {
 
     /// The note's tuned frequency in Hz. **Real-time safe**.
     ///
-    /// Prefer [`Client::retuning_in_semitones`] unless you drive an oscillator from an absolute
-    /// frequency, which overrides pitch modulations instead of composing with it.
+    /// An absolute frequency overrides pitch modulation instead of composing with it, so prefer
+    /// [`Client::retuning_in_semitones`] for a voice that only retunes its note, and
+    /// [`TuningMap`] for one whose pitch modulation should follow the scale.
     #[inline]
     pub fn note_to_frequency(&self, note: u8, channel: Option<u8>) -> f64 {
         unsafe { sys::MTS_NoteToFrequency(self.as_ptr(), midi_note(note), midi_channel(channel)) }
     }
 
     /// The note's offset from 12-TET, in semitones. Zero without a master. **Real-time safe**.
+    ///
+    /// See also [`TuningMap`] to apply tuning with pitch modulation.
     #[inline]
     pub fn retuning_in_semitones(&self, note: u8, channel: Option<u8>) -> f64 {
         unsafe {
@@ -196,7 +235,7 @@ impl Client {
     pub fn frequency_to_note(&self, frequency: f64, channel: Option<u8>) -> u8 {
         let note =
             unsafe { sys::MTS_FrequencyToNote(self.as_ptr(), frequency, midi_channel(channel)) };
-        note as u8 & 127
+        note as u8
     }
 
     /// The note closest to `frequency`, together with the MIDI channel to send it on. **Real-time safe**.
@@ -286,8 +325,8 @@ impl std::fmt::Debug for Client {
 
 // -------------------------------------------------------------------------------------------------
 
-/// `None` is the C API's "no particular channel" (-1). Out-of-range channels are harmless: the C
-/// side reads anything outside 0..=15 as channel-agnostic too.
+/// `None` is the C API's "no particular channel" (-1). An out-of-range channel is clamped,
+/// but asserted. The C API masks the channel to ensure it's in the valid range.
 #[inline]
 fn midi_channel(channel: Option<u8>) -> i8 {
     match channel {
@@ -296,17 +335,17 @@ fn midi_channel(channel: Option<u8>) -> i8 {
                 channel < 16,
                 "MIDI channel {channel} is out of range 0..=15"
             );
-            channel as i8
+            channel.min(15) as i8
         }
         None => -1,
     }
 }
 
-/// The C side masks notes to 0..=127 itself, so this is a plain reinterpretation.
+/// The C side masks notes to 0..=127, so clamp instead for consistency with [`TuningMap`].
 #[inline]
 fn midi_note(note: u8) -> c_char {
     debug_assert!(note < 128, "MIDI note {note} is out of range 0..=127");
-    note as c_char
+    note.min(127) as c_char
 }
 
 /// Keyboard map queries report "not supplied by a master" as -1.
