@@ -3,17 +3,18 @@ name = "mts-client-rs"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.82"
+authors = ["Eduard Müller <mail@emuell.net>"]
 description = "Safe Rust bindings for the ODDSound MTS-ESP microtuning client"
 license = "0BSD"
 repository = "https://github.com/emuell/mts-client-rs"
 readme = "README.md"
 categories = ["multimedia::audio", "api-bindings"]
-keywords = ["audio", "midi", "microtuning", "tuning", "mts-esp"]
+keywords = ["audio", "midi", "microtonal", "tuning", "mts-esp"]
 links = "mtsclient"
 exclude = [
-    # Prebuilt libMTS binaries and installers
+    # Exclude prebuilt libMTS binaries and installers.
     "vendor/MTS-ESP/libMTS/**",
-    # Master-side API, which is not wrapped here.
+    # Exclude master-side API, which is not wrapped here.
     "vendor/MTS-ESP/Master/**",
     "vendor/MTS-ESP/.github/**",
 ]

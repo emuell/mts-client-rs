@@ -8,6 +8,21 @@ This crate wraps the vendored ODDSound **client** library (`libMTSClient`) as a 
 
 `TuningMap` (an addition of this crate, not part of `libMTSClient`) indexes the tuning by fractional *scale steps* rather than by MIDI *keys*, so pitch modulation such as glide or bend can move through the master's scale as well.
 
+## Installation
+
+```sh
+cargo add mts-client-rs
+```
+
+or add it manually to your `Cargo.toml`:
+
+```toml
+[dependencies]
+mts-client-rs = "0.1"
+```
+
+The vendored client sources are part of the published crate, so all you need to build is a C++ compiler (MSVC, clang++ or g++) and Rust 1.82 or later. 
+
 ## Examples and Usage
 
 Examples covering initialization, note re-tuning, modulating pitch within the scale, reporting tuning to the user, and the MTS SysEx fallback can be found in the crate documentation, along with the real-time safety rules and platform notes:
@@ -15,9 +30,7 @@ Examples covering initialization, note re-tuning, modulating pitch within the sc
 - [docs.rs/mts-client-rs](https://docs.rs/mts-client-rs): the rendered API documentation
 - [`src/lib.rs`](https://github.com/emuell/mts-client-rs/blob/master/src/lib.rs): the module docs it is generated from
 
-## Building
-
-Rust 1.82 or later and a C++ compiler (MSVC, clang++ or g++).
+## Building from source
 
 Clone with `git clone --recurse-submodules <url>`: the client source is a git submodule under `vendor/MTS-ESP/`.
 
