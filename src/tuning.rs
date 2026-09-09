@@ -1,268 +1,408 @@
-//! A scale-step view of a master tuning, for clients that want to modulate pitch with tuning.
+//! Applying a tuning to a *modulated* pitch, by walking the scale.
 
 use crate::Client;
 
 // -------------------------------------------------------------------------------------------------
 
-/// Number of MIDI keys and thus the largest possible number of scale steps.
-const KEY_COUNT: usize = 128;
-
-/// A key counts as retuned when it is off 12-TET by more than this. Must be far below hearing.
-const RETUNED_EPSILON_SEMITONES: f64 = 1e-6;
-
-/// One semitone in `log2` frequency units.
-const SEMITONE_IN_LOG2: f64 = 1.0 / 12.0;
+/// Number of MIDI keys.
+const KEY_COUNT: i32 = 128;
+/// Highest MIDI key.
+const LAST_KEY: i32 = KEY_COUNT - 1;
 
 // -------------------------------------------------------------------------------------------------
 
-/// A snapshot of a master's keyboard map and tuning, indexed by scale steps (semitones in standard
-/// tuning) rather than MIDI keys.
+/// Apply note scaling with fractional modulation on top.
 ///
-/// [`Client::retuning_in_semitones`] re-tunes a *note*, but synths add pitch modulation on top of
-/// it: glide, pitch bend, an LFO on oscillator pitch. Added as plain semitones that modulation
-/// moves through 12-TET, while the note it starts from sits in the master's scale.
+/// [`Client::retuning_in_semitones`] retunes a *note*, but synths add pitch modulation on top of
+/// it: pitch bend, glide, an LFO on oscillator pitch. Added as plain semitones, that modulation
+/// moves through 12-TET while the note it starts from sits in the scale, so a voice drifts out of
+/// tune as soon as it leaves its key.
 ///
-/// With MPE this gets worse, because pitch-bend is how a voice reaches other notes, and bending
-/// in 12-TET never arrives at that note's retuned pitch.
+/// [`Tuning::frequency`] takes a key and one offset of each kind, because which unit is right
+/// depends on where the modulation comes from:
 ///
-/// In the `TuningMap` one unit of modulation is one step of the master's scale, and fractions
-/// of steps interpolate between neighbouring mapped steps.
+/// * `key_offset` is a fractional offset in **MIDI keys**, one key being one semitone in 12-TET:
+///   MPE pitch bend, whose range MPE defines in semitones, and anything else driven by a
+///   controller's key geometry. A key width of it stays a key width, so a physical octave stays an
+///   octave whether or not the keys in between are mapped. The pitch is taken from the mapped keys
+///   only and interpolated across unmapped ones, so a slide over a gap ramps smoothly between the
+///   scale pitches either side of it rather than resting on a pitch the scale does not contain.
 ///
-/// Create one with [`TuningMap::new`] and refresh it with [`TuningMap::update`], then keep it for
-/// the lifetime of your voice pool. The update and every query are **real-time safe**, so the map
-/// can live entirely on the audio thread.
+/// * `step_modulation` is measured in **scale steps**: an LFO or envelope moving a voice by scale
+///   degrees, an arpeggiator or sequencer transposing within the scale. A whole unit lands on the
+///   next note of the scale, and a fraction interpolates between neighbouring ones.
 ///
-/// Note that a map describes a single MIDI channel. Masters using multi-channel tuning tables
-/// need one map per channel; pass `None` for the channel-agnostic tuning that most clients want.
+/// The key offset applies first, and the steps are then walked from the bent position, so a scale
+/// step is as wide as the scale is where the voice actually is. Pass `0.0` for the one you do not
+/// need. For a scale without gaps the two units are the same thing; they part ways only where a
+/// key is unmapped, or where a scale repeats a key's pitch instead of filtering it.
 ///
-/// Every query takes a MIDI key in range `0..=127`. A key beyond that is a caller bug: it panics
-/// in debug builds and is clamped to the last key in release ones.
+/// Modulation that should *not* follow the scale, e.g. a vibrato LFO in plain semitones, can be
+/// applied last, on top of the result: add it to the fractional key that [`Tuning::pitch`] returns,
+/// or multiply the frequency by `2^(semitones / 12)`.
+///
+/// Implement this for your own scale, or use [`MtsTuning`] for an MTS-ESP master and
+/// [`ScaleTuning`] for a tuning that comes from elsewhere. Only the first two methods are
+/// required; the rest describe how the scale repeats, and answer for plain 12-TET by default.
 ///
 /// # Example
 ///
 /// ```no_run
-/// use mts_client_rs::{Client, TuningMap};
+/// use mts_client_rs::{Client, MtsTuning, Tuning};
 ///
 /// # let client = Client::new().unwrap();
-/// let mut tuning = TuningMap::new();
+/// // Pass `None` as channel for MPE, where the member channel identifies the voice.
+/// let tuning = MtsTuning::new(&client, None);
 ///
-/// // Once per audio block, so active voices follow automated tunings.
-/// tuning.update(&client, None);
-///
-/// // Per voice: `modulation` is the voice's total pitch offset from its key.
-/// let key = 60;
-/// let modulation = 2.0; // e.g. a pitch bend two scale steps (semitones in 12-TET) up
-/// if !tuning.should_filter_note(key) {
-///     let frequency = tuning.frequency(key, modulation);
+/// // Per voice: an MPE bend in semitones, and an LFO in scale steps.
+/// let (key, mpe_bend_in_semitones, lfo_in_steps) = (60, 2.0, 0.5);
+/// if !tuning.is_key_filtered(key) {
+///     let frequency = tuning.frequency(key, mpe_bend_in_semitones, lfo_in_steps);
 /// }
 /// ```
-#[derive(Clone)]
-pub struct TuningMap {
-    step_log2: [f64; KEY_COUNT],
-    step_of_key: [u8; KEY_COUNT],
-    filtered: [bool; KEY_COUNT],
-    step_count: usize,
-    active: bool,
-}
+pub trait Tuning {
+    /// True when the scale leaves `key` unmapped. Unmapped keys should not start playback.
+    fn is_key_filtered(&self, key: u8) -> bool;
 
-impl Default for TuningMap {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+    /// The key's offset from 12-TET in semitones, ignoring any modulation.
+    fn key_retuning_in_semitones(&self, key: u8) -> f64;
 
-impl TuningMap {
-    /// Creates a new map of plain 12-TET with every key mapped. Call [`TuningMap::update`] to
-    /// apply a tuning from an MTS master.
-    pub fn new() -> Self {
-        let mut map = Self {
-            step_log2: [0.0; KEY_COUNT],
-            step_of_key: [0; KEY_COUNT],
-            filtered: [false; KEY_COUNT],
-            step_count: 0,
-            active: false,
-        };
-        map.fill(|key| Some(twelve_tet_frequency_for_key(key)));
-        map
+    /// How far apart the scale's repetitions are, in semitones. 12.0 by default (an octave).
+    fn period_in_semitones(&self) -> f64 {
+        12.0
     }
 
-    /// Re-read the master's tuning and update the map accordingly.
+    /// How many MIDI keys one repetition of the scale spans, when that is known.
     ///
-    /// **Real-time safe**: this only uses [`Client::should_filter_note`] and
-    /// [`Client::note_to_frequency`] which are both lock-free reads.
+    /// This is used to extend modulation past the ends of the keyboard. Without it,
+    /// pitch past either end extends in plain semitones.
+    fn keys_per_period(&self) -> Option<u8> {
+        None
+    }
+
+    /// The tuned frequency of `key`, moved by both kinds of modulation, in Hz.
     ///
-    /// A master can retune at any time and gives no notification, so call this periodically
-    /// (once per audio block, or on whatever slower control tick the client already has).
-    pub fn update(&mut self, client: &Client, channel: Option<u8>) {
-        self.fill(|key| {
-            (!client.should_filter_note(key, channel))
-                .then(|| client.note_to_frequency(key, channel))
-        })
+    /// See the [trait docs](Tuning) for what the two offsets mean and when they differ.
+    fn frequency(&self, key: u8, key_offset: f64, step_modulation: f64) -> f64 {
+        let pitch = self.pitch(key, key_offset, step_modulation);
+        440.0 * ((pitch - 69.0) / 12.0).exp2()
     }
 
-    /// Rebuild the map from a custom tuning instead of a MTS master.
+    /// The offset from 12-TET in semitones, of [`Tuning::frequency`]: what to add to
+    /// `key + key_offset + step_modulation` to reach the final tuned pitch.
     ///
-    /// `key_frequency` should return the key's frequency in Hz, or `None` when the key is
-    /// unmapped, for every key in range 0..128.
-    ///
-    /// This can be useful for clients whose tuning does not come from an MTS-ESP master,
-    /// e.g. a Scala file, or a tuning the host supplies.
-    pub fn update_with(&mut self, key_frequency: impl FnMut(u8) -> Option<f64>) {
-        self.fill(key_frequency)
+    /// See the [trait docs](Tuning) for what the two offsets mean and when they differ.
+    fn retuning_in_semitones(&self, key: u8, key_offset: f64, step_modulation: f64) -> f64 {
+        let pitch = self.pitch(key, key_offset, step_modulation);
+        pitch - (key as f64 + key_offset + step_modulation)
     }
 
-    /// False when the map is plain 12-TET with every key mapped to a pitch of its own, in order
-    /// to simplify processing.
-    #[inline]
-    pub fn is_active(&self) -> bool {
-        self.active
-    }
-
-    /// How many notes the keyboard map holds. 128 for a map without gaps.
-    #[inline]
-    pub fn step_count(&self) -> usize {
-        self.step_count
-    }
-
-    /// True when the map leaves the given `key` unmapped, in which case it should not start a
-    /// voice. Equivalent of [`Client::should_filter_note`].
-    #[inline]
-    pub fn should_filter_note(&self, key: u8) -> bool {
-        debug_assert!(key < 128, "MIDI key {key} is out of range 0..=127");
-        self.filtered[key_index(key)]
-    }
-
-    /// The tuned frequency `modulation` scale steps away from `key`, in Hz.
-    ///
-    /// A whole `modulation` lands exactly on another note of the scale. A fraction will get
-    /// interpolated geometrically between its neighbours, so a unit of modulation is a constant
-    /// number of cents within a step.
-    ///
-    /// Past the ends of the map the outermost step interval gets repeated, so pitch modulation
-    /// can keep moving past the end instead of freezing against the last mapped note.
-    #[inline]
-    pub fn frequency(&self, key: u8, modulation: f64) -> f64 {
-        debug_assert!(key < 128, "MIDI key {key} is out of range 0..=127");
-        if !self.active || self.step_count == 0 {
-            return twelve_tet_frequency_for_fractional_key(key as f64 + modulation);
-        }
-        let position = self.step_of_key[key_index(key)] as f64 + modulation;
-        let index = position.floor();
-        let fraction = position - index;
-        let index = index as i32;
-        let lower = self.step_log2_at(index);
-        let upper = self.step_log2_at(index + 1);
-        (lower + (upper - lower) * fraction).exp2()
-    }
-
-    /// The offset from 12-TET in semitones, of [`TuningMap::frequency`]: what to add to
-    /// `key + modulation` to reach the final tuned pitch. Zero, when the map is inactive.
-    ///
-    /// See also [`TuningMap::frequency`] which can be useful when e.g. driving an
-    /// oscillator to initialize it with an absolute frequency.
-    #[inline]
-    pub fn retuning_in_semitones(&self, key: u8, modulation: f64) -> f64 {
-        debug_assert!(key < 128, "MIDI key {key} is out of range 0..=127");
-        if !self.active || self.step_count == 0 {
-            return 0.0;
-        }
-        twelve_tet_key_for_frequency(self.frequency(key, modulation)) - (key as f64 + modulation)
-    }
-
-    /// How many scale steps apart two keys are. Negative when `to` is below `from`.
-    ///
-    /// This is the modulation distance for a glide between the two keys: the plain key
-    /// distance would traverse the scale at the wrong rate, and end on the wrong note.
-    #[inline]
-    pub fn step_distance(&self, from: u8, to: u8) -> i32 {
-        debug_assert!(from < 128, "MIDI key {from} is out of range 0..=127");
-        debug_assert!(to < 128, "MIDI key {to} is out of range 0..=127");
-        let from = self.step_of_key[key_index(from)] as i32;
-        let to = self.step_of_key[key_index(to)] as i32;
-        to - from
-    }
-
-    #[inline]
-    fn step_log2_at(&self, index: i32) -> f64 {
-        debug_assert!(self.step_count > 0);
-        // Past either end, repeat the outermost interval rather than clamping the pitch.
-        let last = self.step_count as i32 - 1;
-        if index < 0 {
-            self.step_log2[0] + index as f64 * self.step_interval(0)
-        } else if index > last {
-            self.step_log2[last as usize] + (index - last) as f64 * self.step_interval(last)
-        } else {
-            self.step_log2[index as usize]
-        }
-    }
-
-    /// The width of the step ending at `index`, in `log2` units.
-    #[inline]
-    fn step_interval(&self, index: i32) -> f64 {
-        // A map too small to have an interval of its own extends in plain semitones.
-        if self.step_count < 2 {
-            return SEMITONE_IN_LOG2;
-        }
-        let index = index.clamp(1, self.step_count as i32 - 1) as usize;
-        self.step_log2[index] - self.step_log2[index - 1]
-    }
-
-    fn fill(&mut self, mut key_frequency: impl FnMut(u8) -> Option<f64>) {
-        let twelve_tet_log2 = 440.0_f64.log2() - 69.0 * SEMITONE_IN_LOG2;
-        let mut active = false;
-        let mut step_count = 0;
-        let mut last_frequency = f64::NAN;
-        for key in 0..KEY_COUNT {
-            let frequency = key_frequency(key as u8);
-            self.filtered[key] = frequency.is_none();
-            match frequency {
-                Some(frequency) if frequency > 0.0 && frequency != last_frequency => {
-                    let log2 = frequency.log2();
-                    self.step_log2[step_count] = log2;
-                    step_count += 1;
-                    last_frequency = frequency;
-                    let retuning =
-                        (log2 - (twelve_tet_log2 + key as f64 * SEMITONE_IN_LOG2)) * 12.0;
-                    active |= retuning.abs() > RETUNED_EPSILON_SEMITONES;
-                }
-                // An unmapped key, or one a master without a keyboard map left out by repeating
-                // its predecessor's frequency. Nothing about 12-TET does either.
-                _ => active = true,
-            }
-            self.step_of_key[key] = step_count.saturating_sub(1) as u8;
-        }
-        self.step_count = step_count;
-        self.active = active;
+    /// The tuned pitch of `key` as a fractional MIDI key (69.0 = A4 in 12-TET).
+    fn pitch(&self, key: u8, key_offset: f64, step_modulation: f64) -> f64 {
+        debug_assert!(
+            key < KEY_COUNT as u8,
+            "MIDI key {key} is out of range 0..=127"
+        );
+        debug_assert!(
+            key_offset.is_finite() && step_modulation.is_finite(),
+            "modulation {key_offset}/{step_modulation} is not a finite number"
+        );
+        ScaleWalk::new(self).pitch(key as f64 + key_offset, step_modulation)
     }
 }
 
-impl std::fmt::Debug for TuningMap {
+// -------------------------------------------------------------------------------------------------
+
+/// Tuning implementation of a MTS-ESP master *for one MIDI channel*.
+///
+/// Build one per audio block or per voice rather than storing it. Every query reads the master
+/// directly, so an automated tuning is followed automatically.
+///
+/// Pass `Some(channel)` when the note's MIDI channel is known, so masters using multi-channel
+/// tuning tables can answer precisely. MPE is the exception: there the member channel identifies
+/// the voice rather than a tuning table, so MTS-ESP recommends `None` while in MPE mode.
+pub struct MtsTuning<'a> {
+    client: &'a Client,
+    channel: Option<u8>,
+}
+
+impl<'a> MtsTuning<'a> {
+    /// Reads `client` on `channel`, or channel-agnostically with `None`.
+    pub fn new(client: &'a Client, channel: Option<u8>) -> Self {
+        Self { client, channel }
+    }
+}
+
+impl Tuning for MtsTuning<'_> {
+    #[inline]
+    fn is_key_filtered(&self, key: u8) -> bool {
+        self.client.should_filter_note(key, self.channel)
+    }
+
+    #[inline]
+    fn key_retuning_in_semitones(&self, key: u8) -> f64 {
+        self.client.retuning_in_semitones(key, self.channel)
+    }
+
+    #[inline]
+    fn period_in_semitones(&self) -> f64 {
+        self.client.period_semitones()
+    }
+
+    #[inline]
+    fn keys_per_period(&self) -> Option<u8> {
+        self.client.map_size()
+    }
+}
+
+impl std::fmt::Debug for MtsTuning<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TuningMap")
-            .field("active", &self.active)
-            .field("step_count", &self.step_count)
+        f.debug_struct("MtsTuning")
+            .field("channel", &self.channel)
             .finish()
     }
 }
 
 // -------------------------------------------------------------------------------------------------
 
-#[inline]
-fn key_index(key: u8) -> usize {
-    (key as usize).min(KEY_COUNT - 1)
+/// Tuning implementation that does not come from an MTS-ESP master, e.g. a Scala file or a
+/// completely custom one.
+///
+/// Holds one retuning per MIDI key, so queries need no allocation and are real-time safe.
+#[derive(Clone)]
+pub struct ScaleTuning {
+    retuning: [f64; KEY_COUNT as usize],
+    filtered: [bool; KEY_COUNT as usize],
+    period_in_semitones: f64,
+    keys_per_period: Option<u8>,
 }
 
-#[inline]
-fn twelve_tet_frequency_for_key(key: u8) -> f64 {
-    twelve_tet_frequency_for_fractional_key(key as f64)
+impl Default for ScaleTuning {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
-#[inline]
-fn twelve_tet_frequency_for_fractional_key(key: f64) -> f64 {
-    440.0 * ((key - 69.0) * SEMITONE_IN_LOG2).exp2()
+impl ScaleTuning {
+    /// Create a new plain 12-TET tuning, with every key mapped.
+    pub fn new() -> Self {
+        Self {
+            retuning: [0.0; KEY_COUNT as usize],
+            filtered: [false; KEY_COUNT as usize],
+            period_in_semitones: 12.0,
+            keys_per_period: None,
+        }
+    }
+
+    /// Builds a scale from a frequency per key in Hz, or `None` when the key is unmapped.
+    pub fn from_frequencies(mut key_frequency: impl FnMut(u8) -> Option<f64>) -> Self {
+        let mut scale = Self::new();
+        for key in 0..KEY_COUNT {
+            match key_frequency(key as u8) {
+                Some(frequency) if frequency > 0.0 => {
+                    scale.retuning[key as usize] =
+                        69.0 + 12.0 * (frequency / 440.0).log2() - key as f64;
+                }
+                _ => scale.filtered[key as usize] = true,
+            }
+        }
+        scale
+    }
+
+    /// Sets how the scale repeats, which is what carries modulation past the ends of the keyboard.
+    ///
+    /// Without it, pitch past either end extends in plain semitones.
+    pub fn with_period(mut self, semitones: f64, keys_per_period: u8) -> Self {
+        self.period_in_semitones = semitones;
+        self.keys_per_period = Some(keys_per_period);
+        self
+    }
 }
 
-#[inline]
-fn twelve_tet_key_for_frequency(frequency: f64) -> f64 {
-    69.0 + 12.0 * (frequency / 440.0).log2()
+impl Tuning for ScaleTuning {
+    #[inline]
+    fn is_key_filtered(&self, key: u8) -> bool {
+        debug_assert!(
+            key < KEY_COUNT as u8,
+            "MIDI key {key} is out of range 0..=127"
+        );
+        self.filtered[(key as usize).min(LAST_KEY as usize)]
+    }
+
+    #[inline]
+    fn key_retuning_in_semitones(&self, key: u8) -> f64 {
+        debug_assert!(
+            key < KEY_COUNT as u8,
+            "MIDI key {key} is out of range 0..=127"
+        );
+        self.retuning[(key as usize).min(LAST_KEY as usize)]
+    }
+
+    #[inline]
+    fn period_in_semitones(&self) -> f64 {
+        self.period_in_semitones
+    }
+
+    #[inline]
+    fn keys_per_period(&self) -> Option<u8> {
+        self.keys_per_period
+    }
+}
+
+impl std::fmt::Debug for ScaleTuning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mapped = self.filtered.iter().filter(|filtered| !**filtered).count();
+        f.debug_struct("ScaleTuning")
+            .field("mapped_keys", &mapped)
+            .field("period_in_semitones", &self.period_in_semitones)
+            .field("keys_per_period", &self.keys_per_period)
+            .finish()
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+
+/// Walks the notes of a [`Tuning`]'s scale to apply modulation within the scale.
+///
+/// Notes are `(key, pitch)` tuples: the key a note starts on, and its retuned pitch as
+/// fractional 12-TET key.
+struct ScaleWalk<'a, T: Tuning + ?Sized> {
+    tuning: &'a T,
+    /// How many keys and how many semitones one repetition of the scale spans, when known.
+    period: Option<(i32, f64)>,
+    /// How many keys to search for the next note before giving up the search.
+    search_limit: i32,
+}
+
+impl<'a, T: Tuning + ?Sized> ScaleWalk<'a, T> {
+    fn new(tuning: &'a T) -> Self {
+        let period = tuning
+            .keys_per_period()
+            .filter(|keys| *keys > 0)
+            .map(|keys| (keys as i32, tuning.period_in_semitones()));
+        let search_limit = 2 * period.map_or(KEY_COUNT, |(keys, _)| keys);
+        Self {
+            tuning,
+            period,
+            search_limit,
+        }
+    }
+
+    /// The tuned pitch of a fractional `bent_key`, moved by `step_modulation` scale steps.
+    fn pitch(&self, bent_key: f64, step_modulation: f64) -> f64 {
+        // Skip interpolation when the key is not modulated.
+        if step_modulation == 0.0 && bent_key.fract() == 0.0 {
+            if let Some(pitch) = self.pitch_of(bent_key as i32) {
+                return pitch;
+            }
+        }
+        // The note the bent position sits on, and the next one above it.
+        let mut below = self.notes_at_or_below(bent_key.floor() as i32);
+        let Some(mut lower) = below.next() else {
+            // Nothing mapped: no scale to follow -> plain 12-TET.
+            return bent_key + step_modulation;
+        };
+        let mut above = self.notes_above(lower);
+        let Some(mut upper) = above.next() else {
+            // A single note has no interval of its own: extend it in plain semitones.
+            let (lower_key, lower_pitch) = lower;
+            return lower_pitch + (bent_key + step_modulation - lower_key as f64);
+        };
+
+        // Scale steps from `lower`: the bent position ramps evenly across the keys up to `upper`,
+        // so a slide over a gap sweeps smoothly, and the step modulation adds on top of that.
+        let ((lower_key, _), (upper_key, _)) = (lower, upper);
+        let mut steps =
+            (bent_key - lower_key as f64) / (upper_key - lower_key) as f64 + step_modulation;
+
+        // Walk whole steps until `steps` lies between `lower` and `upper`.
+        while steps >= 1.0 {
+            let Some(next) = above.next() else { break };
+            (lower, upper) = (upper, next);
+            steps -= 1.0;
+        }
+        while steps < 0.0 {
+            let Some(previous) = below.next() else { break };
+            (lower, upper) = (previous, lower);
+            steps += 1.0;
+        }
+
+        let ((_, lower_pitch), (_, upper_pitch)) = (lower, upper);
+        lower_pitch + (upper_pitch - lower_pitch) * steps
+    }
+
+    /// A key's pitch as a fractional 12-TET key or `None` when it's unmapped.
+    ///
+    /// Past the ends of the keyboard a key repeats the key whole periods in, or without a period,
+    /// continues the outermost key in plain semitones.
+    fn pitch_of(&self, key: i32) -> Option<f64> {
+        let (resolved, shift) = match self.period {
+            Some((keys_per_period, period_in_semitones)) if !(0..=LAST_KEY).contains(&key) => {
+                // Whole periods to shift by, so that the key lands back on the keyboard.
+                let periods = if key < 0 {
+                    key.div_euclid(keys_per_period)
+                } else {
+                    (key - LAST_KEY + keys_per_period - 1) / keys_per_period
+                };
+                let resolved = (key - periods * keys_per_period).clamp(0, LAST_KEY);
+                (resolved, periods as f64 * period_in_semitones)
+            }
+            _ => {
+                let held = key.clamp(0, LAST_KEY);
+                (held, (key - held) as f64)
+            }
+        };
+        let resolved = resolved as u8;
+        (!self.tuning.is_key_filtered(resolved))
+            .then(|| resolved as f64 + self.tuning.key_retuning_in_semitones(resolved) + shift)
+    }
+
+    /// Two keys count as the same note when their pitches are this close, in semitones.
+    fn same_pitch(one: f64, other: f64) -> bool {
+        const SAME_PITCH_EPSILON: f64 = 1e-9;
+        (one - other).abs() <= SAME_PITCH_EPSILON
+    }
+
+    /// Iterator of retuned notes starting at or below `key`, in descending order.
+    fn notes_at_or_below(&self, key: i32) -> impl Iterator<Item = (i32, f64)> + '_ {
+        let mut key = key + 1;
+        let mut pending: Option<(i32, f64)> = None;
+        std::iter::from_fn(move || {
+            for _ in 0..self.search_limit {
+                key -= 1;
+                let Some(pitch) = self.pitch_of(key) else {
+                    continue;
+                };
+                match &mut pending {
+                    Some((note_key, note_pitch)) if Self::same_pitch(*note_pitch, pitch) => {
+                        *note_key = key
+                    }
+                    _ => {
+                        if let Some(note) = pending.replace((key, pitch)) {
+                            return Some(note);
+                        }
+                    }
+                }
+            }
+            pending.take()
+        })
+    }
+
+    /// Iterator of retuned notes above `note`, in ascending order.
+    fn notes_above(&self, note: (i32, f64)) -> impl Iterator<Item = (i32, f64)> + '_ {
+        let (mut key, mut pitch) = note;
+        std::iter::from_fn(move || {
+            for _ in 0..self.search_limit {
+                key += 1;
+                match self.pitch_of(key) {
+                    Some(next) if !Self::same_pitch(next, pitch) => {
+                        pitch = next;
+                        return Some((key, pitch));
+                    }
+                    _ => {}
+                }
+            }
+            None
+        })
+    }
 }
