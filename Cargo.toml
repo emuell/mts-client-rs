@@ -21,3 +21,6 @@ exclude = [
 
 [build-dependencies]
 cc = "1.4"
+
+[lints.clippy]
+collapsible_if = "allow"
