@@ -18,7 +18,7 @@ or add it manually to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-mts-client-rs = "0.1"
+mts-client-rs = "0.2"
 ```
 
 The vendored client sources are part of the published crate, so all you need to build is a C++ compiler (MSVC, clang++ or g++) and Rust 1.82 or later. 
